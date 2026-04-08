@@ -5,7 +5,7 @@ Official Go client for the [Verifex](https://verifex.dev) sanctions screening AP
 ## Installation
 
 ```bash
-go get github.com/sadatnazarli/verifex-go
+go get github.com/Verifex-dev/verifex-go-sdk
 ```
 
 ## Quick Start
@@ -18,7 +18,7 @@ import (
 	"fmt"
 	"log"
 
-	verifex "github.com/sadatnazarli/verifex-go"
+	verifex "github.com/Verifex-dev/verifex-go-sdk"
 )
 
 func main() {

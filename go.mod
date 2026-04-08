@@ -1,3 +1,3 @@
-module github.com/sadatnazarli/verifex-go-sdk
+module github.com/Verifex-dev/verifex-go-sdk
 
 go 1.21
