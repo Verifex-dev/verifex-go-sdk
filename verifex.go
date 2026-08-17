@@ -84,10 +84,11 @@ func New(apiKey string, opts ...Option) *Client {
 // ScreenRequest is the input for screening a single entity.
 type ScreenRequest struct {
 	Name        string `json:"name"`
-	Type        string `json:"type,omitempty"`         // "person" or "entity"
+	Type        string `json:"type,omitempty"`          // "person" or "entity"
 	Country     string `json:"country,omitempty"`
 	DateOfBirth string `json:"date_of_birth,omitempty"`
-	Mode        string `json:"mode,omitempty"`         // "exact" or "broad"
+	Mode        string `json:"mode,omitempty"`          // "exact" or "broad"
+	Explain     bool   `json:"explain,omitempty"`       // return v3 explainability data
 }
 
 // Screen screens a single entity against all sanctions lists.

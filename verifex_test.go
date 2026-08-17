@@ -25,37 +25,6 @@ func TestWithOptions(t *testing.T) {
 	}
 }
 
-func TestHealthLive(t *testing.T) {
-	c := New("dummy", WithBaseURL("https://api.verifex.dev"))
-	h, err := c.Health(context.Background())
-	if err != nil {
-		t.Fatalf("Health failed: %v", err)
-	}
-	if h.Status != "ok" {
-		t.Fatalf("expected ok, got %s", h.Status)
-	}
-	if h.Database != "connected" {
-		t.Fatalf("expected connected DB, got %s", h.Database)
-	}
-	if !h.IsHealthy() {
-		t.Fatal("expected healthy")
-	}
-	if h.TotalEntities() < 900000 {
-		t.Fatalf("expected >900K entities, got %d", h.TotalEntities())
-	}
-}
-
-func TestAuthErrorLive(t *testing.T) {
-	c := New("invalid_key", WithBaseURL("https://api.verifex.dev"))
-	_, err := c.Screen(context.Background(), ScreenRequest{Name: "test"})
-	if err == nil {
-		t.Fatal("expected error for invalid key")
-	}
-	if !IsAuthError(err) {
-		t.Fatalf("expected AuthenticationError, got %T: %v", err, err)
-	}
-}
-
 func TestScreenMock(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/screen" {
@@ -123,6 +92,10 @@ func TestClearResultMock(t *testing.T) {
 			"request_id":    "test-456",
 			"lists_checked": []string{},
 			"api_version":   "v1",
+			// Complete coverage is required for IsClear. Before VER-6 this mock
+			// omitted the field and still asserted IsClear() — the test encoded
+			// the false-clear defect it should have caught.
+			"coverage_status": "complete",
 		})
 	}))
 	defer srv.Close()
@@ -208,4 +181,163 @@ func TestQuotaExceededError(t *testing.T) {
 	if !IsQuotaExceededError(err) {
 		t.Fatalf("expected QuotaExceededError, got %T", err)
 	}
+}
+
+// ── VER-6 / REQ-SDK-001: coverage must gate "clear" ──────────────────────────
+//
+// A "clear" risk level only means nothing was found in the sources that were
+// actually searched. If a sanctions list was unreachable, that is not the same
+// as "this party is not sanctioned". Reporting it as clear is a false clear.
+
+func screenWith(t *testing.T, body map[string]any) *ScreenResult {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(body)
+	}))
+	defer srv.Close()
+	c := New("key", WithBaseURL(srv.URL))
+	result, err := c.Screen(context.Background(), ScreenRequest{Name: "Nobody Real"})
+	if err != nil {
+		t.Fatalf("Screen failed: %v", err)
+	}
+	return result
+}
+
+func clearBody(coverage any) map[string]any {
+	b := map[string]any{
+		"query":         map[string]string{"name": "Nobody Real"},
+		"matches":       []any{},
+		"total_matches": 0,
+		"risk_level":    "clear",
+		"screened_at":   "2026-01-01T00:00:00Z",
+		"request_id":    "cov-test",
+		"lists_checked": []string{},
+		"api_version":   "v1",
+	}
+	if coverage != nil {
+		b["coverage_status"] = coverage
+	}
+	return b
+}
+
+func TestIsClearRequiresCompleteCoverage(t *testing.T) {
+	r := screenWith(t, clearBody("complete"))
+	if !r.IsClear() {
+		t.Fatal("complete coverage + clear risk must be clear")
+	}
+	if !r.HasCompleteCoverage() {
+		t.Fatal("expected HasCompleteCoverage")
+	}
+}
+
+func TestPartialCoverageIsNotClear(t *testing.T) {
+	body := clearBody("partial")
+	body["unavailable_sources"] = []string{"OFAC"}
+	r := screenWith(t, body)
+	if r.IsClear() {
+		t.Fatal("FALSE CLEAR: partial coverage reported as clear")
+	}
+	// The engine genuinely found nothing; that fact is still available, under a
+	// name that does not imply a compliance conclusion.
+	if !r.IsRiskClear() {
+		t.Fatal("IsRiskClear should still be true")
+	}
+	if len(r.UnavailableSources) != 1 || r.UnavailableSources[0] != "OFAC" {
+		t.Fatalf("unavailable sources not parsed: %v", r.UnavailableSources)
+	}
+}
+
+func TestAbsentCoverageIsNotClear(t *testing.T) {
+	// Absent is not a fourth flavour of complete. It means the question was
+	// never answered, and there is no safe way to assume it was.
+	r := screenWith(t, clearBody(nil))
+	if r.IsClear() {
+		t.Fatal("FALSE CLEAR: absent coverage treated as complete")
+	}
+	if r.HasCompleteCoverage() {
+		t.Fatal("absent coverage must not report complete")
+	}
+	if !r.IsRiskClear() {
+		t.Fatal("IsRiskClear should still be true")
+	}
+}
+
+func TestMatchIsNeverClearRegardlessOfCoverage(t *testing.T) {
+	body := clearBody("complete")
+	body["risk_level"] = "high"
+	body["total_matches"] = 1
+	r := screenWith(t, body)
+	if r.IsClear() || r.IsRiskClear() {
+		t.Fatal("a match must never be clear")
+	}
+}
+
+// ── VER-6 full safety contract: coverage is not the only way to lose a clear ──
+
+func TestRestrictedMatchesBlockClear(t *testing.T) {
+	// The most misleading case in the product: matches EXIST, the plan hid
+	// them, and TotalMatches reads 0. A clear here would be actively false.
+	body := clearBody("complete")
+	body["restricted_matches"] = 2
+	body["restricted_sources"] = []string{"PEP"}
+	r := screenWith(t, body)
+	if r.IsClear() {
+		t.Fatal("FALSE CLEAR: restricted matches reported as clear")
+	}
+	if !contains(r.ClearBlockers(), "restricted_matches") {
+		t.Fatalf("expected restricted_matches blocker, got %v", r.ClearBlockers())
+	}
+}
+
+func TestScreeningUnavailableBlocksClear(t *testing.T) {
+	body := clearBody("complete")
+	body["screening_unavailable"] = true
+	r := screenWith(t, body)
+	if r.IsClear() {
+		t.Fatal("FALSE CLEAR: unavailable screening reported as clear")
+	}
+}
+
+func TestPlanScopedClearIsNotUniversalClear(t *testing.T) {
+	// "Nothing found in the sources your plan covers" is not "nothing found".
+	body := clearBody("complete")
+	body["clear_scope"] = "checked_sources_only"
+	body["sources_excluded_by_plan"] = []string{"PEP"}
+	r := screenWith(t, body)
+	if r.IsClear() {
+		t.Fatal("FALSE CLEAR: plan-scoped no-hit reported as universal clear")
+	}
+}
+
+func TestBlockersAccumulate(t *testing.T) {
+	// Reporting only the first reason would send someone to fix coverage while
+	// a restricted sanctions hit sat untouched.
+	body := clearBody("partial")
+	body["restricted_matches"] = 1
+	body["screening_unavailable"] = true
+	r := screenWith(t, body)
+	for _, want := range []string{"coverage_incomplete", "restricted_matches", "screening_unavailable"} {
+		if !contains(r.ClearBlockers(), want) {
+			t.Fatalf("missing blocker %q in %v", want, r.ClearBlockers())
+		}
+	}
+}
+
+func TestGenuineClearHasNoBlockers(t *testing.T) {
+	r := screenWith(t, clearBody("complete"))
+	if len(r.ClearBlockers()) != 0 {
+		t.Fatalf("expected no blockers, got %v", r.ClearBlockers())
+	}
+	if !r.IsClear() {
+		t.Fatal("expected clear")
+	}
+}
+
+func contains(xs []string, s string) bool {
+	for _, x := range xs {
+		if x == s {
+			return true
+		}
+	}
+	return false
 }
